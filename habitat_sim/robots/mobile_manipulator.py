@@ -8,6 +8,7 @@ import numpy as np
 from habitat_sim.physics import JointMotorSettings
 from habitat_sim.robots.robot_interface import RobotInterface
 from habitat_sim.simulator import Simulator
+from habitat_sim.utils.common import orthonormalize_rotation_shear
 
 
 @attr.s(auto_attribs=True, slots=True)
@@ -118,10 +119,12 @@ class MobileManipulator(RobotInterface):
         super().__init__()
         self.urdf_path = urdf_path
         self.params = params
+        self._fix_joint_values: Optional[np.ndarray] = None
 
         self._sim = sim
         self._limit_robo_joints = limit_robo_joints
         self._fixed_base = fixed_base
+        self.sim_obj = None
 
         self._cameras = defaultdict(list)
         for camera_prefix in self.params.cameras:
@@ -154,6 +157,9 @@ class MobileManipulator(RobotInterface):
         self.sim_obj = ao_mgr.add_articulated_object_from_urdf(
             self.urdf_path, fixed_base=self._fixed_base
         )
+        if self._limit_robo_joints:
+            # automatic joint limit clamping after each call to sim.step_physics()
+            self.sim_obj.auto_clamp_joint_limits = True
         for link_id in self.sim_obj.get_link_ids():
             self.joint_pos_indices[link_id] = self.sim_obj.get_link_joint_pos_offset(
                 link_id
@@ -221,7 +227,9 @@ class MobileManipulator(RobotInterface):
                 cam_transform = link_trans @ cam_transform @ cam_info.relative_transform
                 cam_transform = inv_T @ cam_transform
 
-                sens_obj.node.transformation = cam_transform
+                sens_obj.node.transformation = orthonormalize_rotation_shear(
+                    cam_transform
+                )
 
         # Guard against out of limit joints
         # TODO: should auto clamping be enabled instead? How often should we clamp?
@@ -235,7 +243,10 @@ class MobileManipulator(RobotInterface):
         NOTE: only arm and gripper joint motors (not gains) are reset by default, derived class should handle any other changes."""
 
         # reset the initial joint positions
+        self.sim_obj.clear_joint_states()
+
         self.arm_joint_pos = self.params.arm_init_params
+        self._fix_joint_values = None
         self.gripper_joint_pos = self.params.gripper_init_params
 
         self._update_motor_settings_cache()
@@ -367,10 +378,30 @@ class MobileManipulator(RobotInterface):
         #    raise ValueError("Control dimension does not match joint dimension")
 
         joint_positions = self.sim_obj.joint_positions
+
         for i, jidx in enumerate(self.params.arm_joints):
             self._set_motor_pos(jidx, ctrl[i])
             joint_positions[self.joint_pos_indices[jidx]] = ctrl[i]
         self.sim_obj.joint_positions = joint_positions
+
+    def _validate_arm_ctrl_input(self, ctrl: List[float]):
+        """
+        Raises an exception if the control input is NaN or does not match the
+        joint dimensions.
+        """
+        if len(ctrl) != len(self.params.arm_joints):
+            raise ValueError("Control dimension does not match joint dimension")
+        if np.any(np.isnan(ctrl)):
+            raise ValueError("Control is NaN")
+
+    def set_fixed_arm_joint_pos(self, fix_arm_joint_pos):
+        """
+        Will fix the arm to a desired position at every internal timestep. Can
+        be used for kinematic arm control.
+        """
+        self._validate_arm_ctrl_input(fix_arm_joint_pos)
+        self._fix_joint_values = fix_arm_joint_pos
+        self.arm_joint_pos = fix_arm_joint_pos
 
     @property
     def arm_velocity(self) -> np.ndarray:
@@ -423,6 +454,8 @@ class MobileManipulator(RobotInterface):
     @base_pos.setter
     def base_pos(self, position):
         """Set the robot base to a desired ground position (e.g. NavMesh point) via configured local offset from origin."""
+        if len(position) != 3:
+            raise ValueError("Base position needs to be three dimensions")
         self.sim_obj.translation = (
             position
             - self.sim_obj.transformation.transform_vector(self.params.base_offset)
@@ -449,13 +482,21 @@ class MobileManipulator(RobotInterface):
     # HIDDEN
     #############################################
 
+    def _validate_joint_idx(self, joint):
+        if joint not in self.joint_motors:
+            raise ValueError(
+                f"Requested joint {joint} not in joint motors with indices (keys {self.joint_motors.keys()}) and {self.joint_motors}"
+            )
+
     def _set_motor_pos(self, joint, ctrl):
+        self._validate_joint_idx(joint)
         self.joint_motors[joint][1].position_target = ctrl
         self.sim_obj.update_joint_motor(
             self.joint_motors[joint][0], self.joint_motors[joint][1]
         )
 
     def _get_motor_pos(self, joint):
+        self._validate_joint_idx(joint)
         return self.joint_motors[joint][1].position_target
 
     def _set_joint_pos(self, joint_idx, angle):
